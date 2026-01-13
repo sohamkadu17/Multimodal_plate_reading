@@ -43,11 +43,10 @@ def save_file(fs, subfolder):
 def ocr_from_image_variants(img_gray):
     best_text = ""
     best_conf = 0.0
+    # Reduced configs for speed - only best performing ones
     configs = [
         "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 7",
         "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 6",
-        "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 11",
-        "--oem 1 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 7",
     ]
     try:
         for cfg in configs:
@@ -65,6 +64,9 @@ def ocr_from_image_variants(img_gray):
                 if cleaned and cval >= 0 and (cval / 100.0) >= best_conf:
                     best_conf = cval / 100.0
                     best_text = cleaned
+            # Early exit if high confidence found
+            if best_conf > 0.85:
+                break
     except Exception:
         pass
 
@@ -87,6 +89,7 @@ def ocr_from_image_variants(img_gray):
 
 
 def detect_plate_and_ocr(image_path):
+    """Optimized plate detection with blur handling"""
     img = cv2.imread(image_path)
     if img is None:
         return "", None, 0.0
@@ -94,202 +97,138 @@ def detect_plate_and_ocr(image_path):
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    def unsharp(image):
-        blurred = cv2.GaussianBlur(image, (3,3), 0)
-        return cv2.addWeighted(image, 1.6, blurred, -0.6, 0)
+    # Detect blur and apply deblurring if needed
+    def detect_blur(image):
+        """Laplacian variance method to detect blur"""
+        return cv2.Laplacian(image, cv2.CV_64F).var()
 
-    def denoise(image):
+    def deblur_wiener(image):
+        """Simple Wiener deconvolution for motion blur"""
         try:
-            return cv2.fastNlMeansDenoising(image, None, h=10, templateWindowSize=7, searchWindowSize=21)
-        except Exception:
+            kernel_size = 5
+            kernel = np.zeros((kernel_size, kernel_size))
+            kernel[int((kernel_size-1)/2), :] = np.ones(kernel_size)
+            kernel = kernel / kernel_size
+            dummy = np.copy(image)
+            dummy = cv2.filter2D(dummy, -1, kernel)
+            return cv2.addWeighted(image, 1.5, dummy, -0.5, 0)
+        except:
             return image
 
-    def upscale(image, fx=2, fy=2):
-        return cv2.resize(image, None, fx=fx, fy=fy, interpolation=cv2.INTER_CUBIC)
+    def unsharp_strong(image):
+        """Strong unsharp mask for blur"""
+        blurred = cv2.GaussianBlur(image, (0, 0), 3)
+        return cv2.addWeighted(image, 2.0, blurred, -1.0, 0)
 
-    variants = []
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    gray_clahe = clahe.apply(gray)
-    variants.append(gray_clahe)
-    variants.append(unsharp(gray_clahe))
-    variants.append(denoise(gray_clahe))
-    variants.append(upscale(gray_clahe, fx=2, fy=2))
-    variants.append(upscale(gray_clahe, fx=3, fy=3))
-    variants.append(upscale(unsharp(gray_clahe), fx=2, fy=2))
-
-    candidates = []
-
-    for var in variants:
-        try:
-            proc = var if len(var.shape) == 2 else cv2.cvtColor(var, cv2.COLOR_BGR2GRAY)
-            # multiple thresholding attempts
-            _, thr_otsu = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            thr_adapt = cv2.adaptiveThreshold(proc,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,11,2)
-            morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-            thr_otsu = cv2.morphologyEx(thr_otsu, cv2.MORPH_CLOSE, morph_kernel)
-            thr_adapt = cv2.morphologyEx(thr_adapt, cv2.MORPH_CLOSE, morph_kernel)
-            for proc_variant in (proc, thr_otsu, thr_adapt):
-                edged = cv2.Canny(proc_variant, 30, 150)
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-                closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
-                contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
-                    if area < 600:  # lower threshold to allow smaller/blurrier plates
-                        continue
-                    x, y, ww, hh = cv2.boundingRect(cnt)
-                    aspect = float(ww) / (hh + 1e-6)
-                    if 1.6 < aspect < 7.5 and ww > max(30, w * 0.08):
-                        pad_y = int(hh * 0.3)
-                        pad_x = int(ww * 0.08)
-                        y0 = max(0, y - pad_y)
-                        y1 = min(h, y + hh + pad_y)
-                        x0 = max(0, x - pad_x)
-                        x1 = min(w, x + ww + pad_x)
-                        if y1 <= y0 or x1 <= x0:
-                            continue
-                        crop = img[y0:y1, x0:x1]
-                        if crop is None or crop.size == 0:
-                            continue
-                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                        crop_up = upscale(crop_gray, fx=2, fy=2)
-                        crop_sharp = unsharp(crop_up)
-                        crop_denoise = denoise(crop_sharp)
-                        _, crop_thr = cv2.threshold(crop_denoise, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                        candidates.append(crop_thr)
-                        candidates.append(crop_denoise)
-                        candidates.append(crop_sharp)
-        except Exception:
-            continue
-
-    # fallback: try OCR on the full image variants if no contours produced candidates
-    if not candidates:
-        for var in variants:
-            try:
-                proc = var if len(var.shape) == 2 else cv2.cvtColor(var, cv2.COLOR_BGR2GRAY)
-                proc_up = upscale(proc, fx=3, fy=3)
-                proc_sharp = unsharp(proc_up)
-                _, proc_thr = cv2.threshold(proc_sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                candidates.append(proc_thr)
-                candidates.append(proc_sharp)
-            except Exception:
-                continue
-
-    best_text = ""
-    best_conf = 0.0
-    best_img = None
-    for cand in candidates:
-        try:
-            if cand is None or getattr(cand, "size", 0) == 0:
-                continue
-            text, conf = ocr_from_image_variants(cand)
-            # prefer longer strings with reasonable confidence
-            score = conf * (1.0 + 0.15 * len(text))
-            if score > best_conf:
-                best_conf = score
-                best_text = text
-                best_img = cand
-        except Exception:
-            continue
-
-    if best_conf > 1.0:
-        best_conf = min(1.0, best_conf)
-
-    plate_filename = None
-    if best_img is not None:
-        try:
-            plate_filename = f"plate_{uuid.uuid4().hex}.png"
-            plate_path = os.path.join(PLATE_DIR, plate_filename)
-            cv2.imwrite(plate_path, best_img)
-        except Exception:
-            plate_filename = None
-
-    return (best_text or "").strip(), plate_filename, float(best_conf)
-
-
-def detect_plate_and_ocr(image_path):
-    img = cv2.imread(image_path)
-    if img is None:
-        return "", None, 0.0
-
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
+    # CLAHE for contrast enhancement
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     gray_clahe = clahe.apply(gray)
 
-    def unsharp(image):
-        blurred = cv2.GaussianBlur(image, (3,3), 0)
-        return cv2.addWeighted(image, 1.5, blurred, -0.5, 0)
+    # Check if image is blurry
+    blur_score = detect_blur(gray_clahe)
+    is_blurry = blur_score < 100
 
-    def gamma_correction(image, gamma=1.0):
-        invGamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-        return cv2.LUT(image, table)
-
+    # Reduce variants for speed - focus on essential preprocessing
     variants = []
-    variants.append(("clahe", gray_clahe))
-    variants.append(("unsharp", unsharp(gray_clahe)))
-    variants.append(("bilateral", cv2.bilateralFilter(gray_clahe, 9, 75, 75)))
-    variants.append(("gamma_up", gamma_correction(gray_clahe, 1.3)))
-    variants.append(("gamma_down", gamma_correction(gray_clahe, 0.7)))
-    variants.append(("resized", cv2.resize(gray_clahe, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)))
+    if is_blurry:
+        # More aggressive deblurring for blurry images
+        deblurred = deblur_wiener(gray_clahe)
+        variants.append(("deblur", deblurred))
+        variants.append(("sharp", unsharp_strong(deblurred)))
+        variants.append(("bilateral", cv2.bilateralFilter(deblurred, 9, 75, 75)))
+    else:
+        # Standard processing for clear images
+        variants.append(("clahe", gray_clahe))
+        variants.append(("bilateral", cv2.bilateralFilter(gray_clahe, 9, 75, 75)))
+
+    # Single upscale only if needed
+    variants.append(("upscale", cv2.resize(gray_clahe, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)))
 
     candidates = []
+    seen_regions = set()
 
     for name, var in variants:
         try:
             proc = var if len(var.shape) == 2 else cv2.cvtColor(var, cv2.COLOR_BGR2GRAY)
-            edged = cv2.Canny(proc, 50, 200)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+            
+            # Single threshold approach for speed
+            _, thr = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Edge detection
+            edged = cv2.Canny(thr, 50, 200)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
             closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+            
             contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 1200:
+                if area < 800:  # Minimum area threshold
                     continue
+                    
                 x, y, ww, hh = cv2.boundingRect(cnt)
                 aspect = float(ww) / (hh + 1e-6)
-                if 2.0 < aspect < 6.5 and ww > w * 0.12:
+                
+                # License plate aspect ratio check
+                if 1.8 < aspect < 7.0 and ww > w * 0.10:
+                    # Avoid duplicate regions
+                    region_key = (x // 10, y // 10, ww // 10, hh // 10)
+                    if region_key in seen_regions:
+                        continue
+                    seen_regions.add(region_key)
+                    
                     pad_y = int(hh * 0.25)
                     pad_x = int(ww * 0.06)
                     y0 = max(0, y - pad_y)
                     y1 = min(h, y + hh + pad_y)
                     x0 = max(0, x - pad_x)
                     x1 = min(w, x + ww + pad_x)
+                    
                     if y1 <= y0 or x1 <= x0:
                         continue
+                        
                     crop = img[y0:y1, x0:x1]
                     if crop is None or crop.size == 0:
                         continue
+                        
                     crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    crop_resized = cv2.resize(crop_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                    
+                    # Enhanced preprocessing for crop
+                    crop_clahe = clahe.apply(crop_gray)
+                    crop_resized = cv2.resize(crop_clahe, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                    
+                    if is_blurry:
+                        crop_resized = unsharp_strong(crop_resized)
+                    
                     _, crop_thr = cv2.threshold(crop_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    crop_unsharp = unsharp(crop_resized)
-                    crop_bilat = cv2.bilateralFilter(crop_resized, 9, 75, 75)
                     candidates.append((crop_thr, x0, y0, x1, y1))
-                    candidates.append((crop_unsharp, x0, y0, x1, y1))
-                    candidates.append((crop_bilat, x0, y0, x1, y1))
+                    
+                    # Limit candidates for speed
+                    if len(candidates) >= 10:
+                        break
         except Exception as e:
-            print("detect_plate variant error:", str(e))
             continue
+        
+        if len(candidates) >= 10:
+            break
 
+    # Fallback: full image OCR if no candidates
     if not candidates:
-        for name, var in variants:
+        for name, var in variants[:2]:  # Only try first 2 variants
             try:
-                try_img = var if len(var.shape) == 2 else cv2.cvtColor(var, cv2.COLOR_BGR2GRAY)
-                resized = cv2.resize(try_img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                proc = var if len(var.shape) == 2 else cv2.cvtColor(var, cv2.COLOR_BGR2GRAY)
+                resized = cv2.resize(proc, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
                 _, thr = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 if thr is not None and thr.size > 0:
                     candidates.append((thr, 0, 0, w, h))
-            except Exception as e:
-                print("global variant error:", str(e))
+            except Exception:
                 continue
 
     best_text = ""
     best_conf = 0.0
     best_img = None
 
+    # Try OCR on candidates
     for crop_img, x0, y0, x1, y1 in candidates:
         try:
             if crop_img is None or getattr(crop_img, "size", 0) == 0:
@@ -300,8 +239,10 @@ def detect_plate_and_ocr(image_path):
                 best_conf = score
                 best_text = text
                 best_img = crop_img
-        except Exception as e:
-            print("ocr candidate error:", str(e))
+            # Early exit if very confident
+            if best_conf > 0.9:
+                break
+        except Exception:
             continue
 
     if best_conf > 1.0:
@@ -313,8 +254,7 @@ def detect_plate_and_ocr(image_path):
             plate_filename = f"plate_{uuid.uuid4().hex}.png"
             plate_path = os.path.join(PLATE_DIR, plate_filename)
             cv2.imwrite(plate_path, best_img)
-        except Exception as e:
-            print("saving plate image error:", str(e))
+        except Exception:
             plate_filename = None
 
     return (best_text or "").strip(), plate_filename, float(best_conf)
