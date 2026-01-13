@@ -1,0 +1,7 @@
+Flask>=2.0
+opencv-python-headless
+pytesseract
+numpy
+librosa
+soundfile
+Werkzeug
