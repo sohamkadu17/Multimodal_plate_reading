@@ -182,7 +182,6 @@ document.addEventListener("DOMContentLoaded", () => {
    function displayResults(data) {
     const html = `
       <div><strong>Plate:</strong> ${data.plate || data.plate_number || '—'}</div>
-      <div><strong>Vehicle:</strong> ${data.vehicle_type || '—'}</div>
       <div><strong>Engine:</strong> ${data.engine || data.engine_type || '—'}</div>
       <div><strong>Speed:</strong> ${data.speed_kmh ? data.speed_kmh + " km/h" : "—"}</div>
       <div><strong>Direction:</strong> ${data.direction || '—'}</div>
