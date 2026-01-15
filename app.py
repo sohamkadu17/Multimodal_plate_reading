@@ -11,6 +11,21 @@ import soundfile as sf
 import subprocess
 import shutil
 
+# Configure Tesseract path for Windows (common installation locations)
+if os.name == 'nt':  # Windows
+    possible_paths = [
+        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        r'C:\Users\{}\AppData\Local\Tesseract-OCR\tesseract.exe'.format(os.getenv('USERNAME')),
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            print(f"[Tesseract] Found at: {path}")
+            break
+    else:
+        print("[Tesseract] WARNING: Tesseract not found. Please install from: https://github.com/UB-Mannheim/tesseract/wiki")
+
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
@@ -42,50 +57,93 @@ def save_file(fs, subfolder):
 
 def ocr_from_image_variants(img_gray):
     best_text = ""
-    best_conf = 0.0
-    # Reduced configs for speed - only best performing ones
+    best_score = 0.0
+    
+    # Multiple PSM modes to handle different text layouts
     configs = [
         "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 7",
         "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 6",
+        "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 8",
+        "--oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 --psm 13",
     ]
+    
+    def is_valid_plate_pattern(text):
+        """Check if text matches typical license plate patterns"""
+        if len(text) < 5 or len(text) > 12:
+            return False
+        # Must have both letters and numbers
+        has_letters = any(c.isalpha() for c in text)
+        has_numbers = any(c.isdigit() for c in text)
+        if not (has_letters and has_numbers):
+            return False
+        # Reject if more than 60% of same character
+        if text:
+            most_common = max(set(text), key=text.count)
+            if text.count(most_common) / len(text) > 0.6:
+                return False
+        return True
+    
     try:
         for cfg in configs:
+            # Method 1: Get full text string
+            try:
+                full_text = pytesseract.image_to_string(img_gray, config=cfg).strip()
+                cleaned = "".join(ch for ch in full_text.upper() if ch.isalnum())
+                if is_valid_plate_pattern(cleaned):
+                    score = len(cleaned) * 0.08 + 0.4
+                    if score > best_score:
+                        best_score = score
+                        best_text = cleaned
+            except:
+                pass
+            
+            # Method 2: Get individual words and concatenate
             data = pytesseract.image_to_data(img_gray, output_type=pytesseract.Output.DICT, config=cfg)
             texts = data.get("text", [])
             confs = data.get("conf", [])
+            
+            # Concatenate all valid text pieces
+            all_pieces = []
+            conf_sum = 0
+            conf_count = 0
+            
             for t, c in zip(texts, confs):
                 if not t or not t.strip():
                     continue
                 try:
                     cval = float(c)
-                except Exception:
-                    cval = -1.0
-                cleaned = "".join(ch for ch in t.upper() if ch.isalnum())
-                if cleaned and cval >= 0 and (cval / 100.0) >= best_conf:
-                    best_conf = cval / 100.0
-                    best_text = cleaned
-            # Early exit if high confidence found
-            if best_conf > 0.85:
+                    if cval < 0:
+                        continue
+                except:
+                    continue
+                    
+                cleaned_piece = "".join(ch for ch in t.upper() if ch.isalnum())
+                if cleaned_piece:
+                    all_pieces.append(cleaned_piece)
+                    conf_sum += cval
+                    conf_count += 1
+            
+            # Try concatenated result
+            if all_pieces:
+                concatenated = "".join(all_pieces)
+                if is_valid_plate_pattern(concatenated):
+                    avg_conf = (conf_sum / conf_count / 100.0) if conf_count > 0 else 0.5
+                    score = avg_conf + (len(concatenated) * 0.08)
+                    if score > best_score:
+                        best_score = score
+                        best_text = concatenated
+            
+            # Early exit if found good result
+            if len(best_text) >= 8 and best_score > 0.8:
                 break
-    except Exception:
+                
+    except Exception as e:
         pass
-
-    # optional EasyOCR fallback if installed
-    try:
-        import easyocr
-        reader = easyocr.Reader(['en'], gpu=False)
-        res = reader.readtext(img_gray, detail=1, paragraph=False)
-        for entry in res:
-            txt = (entry[1] or "").upper()
-            cleaned = "".join(ch for ch in txt if ch.isalnum())
-            conf = float(entry[2]) if len(entry) > 2 else 0.0
-            if cleaned and conf >= best_conf:
-                best_conf = conf
-                best_text = cleaned
-    except Exception:
-        pass
-
-    return best_text, float(best_conf)
+    
+    # Normalize score to 0-1 range
+    final_conf = min(1.0, best_score)
+    
+    return best_text, float(final_conf)
 
 
 def detect_plate_and_ocr(image_path):
@@ -137,9 +195,12 @@ def detect_plate_and_ocr(image_path):
         variants.append(("sharp", unsharp_strong(deblurred)))
         variants.append(("bilateral", cv2.bilateralFilter(deblurred, 9, 75, 75)))
     else:
-        # Standard processing for clear images
+        # Enhanced processing for clear images - try multiple contrast adjustments
         variants.append(("clahe", gray_clahe))
+        variants.append(("original", gray))  # Try original grayscale too
         variants.append(("bilateral", cv2.bilateralFilter(gray_clahe, 9, 75, 75)))
+        # Add light sharpening for clear images
+        variants.append(("light_sharp", cv2.addWeighted(gray_clahe, 1.5, cv2.GaussianBlur(gray_clahe, (0, 0), 1), -0.5, 0)))
 
     # Single upscale only if needed
     variants.append(("upscale", cv2.resize(gray_clahe, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)))
@@ -151,61 +212,89 @@ def detect_plate_and_ocr(image_path):
         try:
             proc = var if len(var.shape) == 2 else cv2.cvtColor(var, cv2.COLOR_BGR2GRAY)
             
-            # Single threshold approach for speed
-            _, thr = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Try multiple threshold approaches for better plate detection
+            thresholds = []
             
-            # Edge detection
-            edged = cv2.Canny(thr, 50, 200)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+            # OTSU thresholding
+            _, thr_otsu = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thresholds.append(thr_otsu)
             
-            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Adaptive thresholding for varied lighting
+            if not is_blurry:  # Adaptive works better on clear images
+                thr_adapt = cv2.adaptiveThreshold(proc, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                   cv2.THRESH_BINARY, 11, 2)
+                thresholds.append(thr_adapt)
             
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < 800:  # Minimum area threshold
-                    continue
-                    
-                x, y, ww, hh = cv2.boundingRect(cnt)
-                aspect = float(ww) / (hh + 1e-6)
+            for thr in thresholds:
+                # Edge detection
+                edged = cv2.Canny(thr, 50, 200)
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
                 
-                # License plate aspect ratio check
-                if 1.8 < aspect < 7.0 and ww > w * 0.10:
-                    # Avoid duplicate regions
-                    region_key = (x // 10, y // 10, ww // 10, hh // 10)
-                    if region_key in seen_regions:
-                        continue
-                    seen_regions.add(region_key)
-                    
-                    pad_y = int(hh * 0.25)
-                    pad_x = int(ww * 0.06)
-                    y0 = max(0, y - pad_y)
-                    y1 = min(h, y + hh + pad_y)
-                    x0 = max(0, x - pad_x)
-                    x1 = min(w, x + ww + pad_x)
-                    
-                    if y1 <= y0 or x1 <= x0:
+                contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < 800:  # Minimum area threshold
                         continue
                         
-                    crop = img[y0:y1, x0:x1]
-                    if crop is None or crop.size == 0:
-                        continue
+                    x, y, ww, hh = cv2.boundingRect(cnt)
+                    aspect = float(ww) / (hh + 1e-6)
+                    
+                    # License plate aspect ratio check
+                    if 1.8 < aspect < 7.0 and ww > w * 0.10:
+                        # Avoid duplicate regions
+                        region_key = (x // 10, y // 10, ww // 10, hh // 10)
+                        if region_key in seen_regions:
+                            continue
+                        seen_regions.add(region_key)
                         
-                    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    
-                    # Enhanced preprocessing for crop
-                    crop_clahe = clahe.apply(crop_gray)
-                    crop_resized = cv2.resize(crop_clahe, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                    
-                    if is_blurry:
-                        crop_resized = unsharp_strong(crop_resized)
-                    
-                    _, crop_thr = cv2.threshold(crop_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    candidates.append((crop_thr, x0, y0, x1, y1))
-                    
-                    # Limit candidates for speed
-                    if len(candidates) >= 10:
-                        break
+                        pad_y = int(hh * 0.25)
+                        pad_x = int(ww * 0.06)
+                        y0 = max(0, y - pad_y)
+                        y1 = min(h, y + hh + pad_y)
+                        x0 = max(0, x - pad_x)
+                        x1 = min(w, x + ww + pad_x)
+                        
+                        if y1 <= y0 or x1 <= x0:
+                            continue
+                            
+                        crop = img[y0:y1, x0:x1]
+                        if crop is None or crop.size == 0:
+                            continue
+                            
+                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        
+                        # Enhanced preprocessing for crop - try multiple methods
+                        crop_clahe = clahe.apply(crop_gray)
+                        crop_resized = cv2.resize(crop_clahe, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                        
+                        if is_blurry:
+                            crop_resized = unsharp_strong(crop_resized)
+                        
+                        # Try multiple preprocessing for the crop
+                        # 1. OTSU threshold
+                        _, crop_thr_otsu = cv2.threshold(crop_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        candidates.append((crop_thr_otsu, x0, y0, x1, y1))
+                        
+                        # 2. Inverted OTSU (white text on black)
+                        _, crop_thr_inv = cv2.threshold(crop_resized, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                        candidates.append((crop_thr_inv, x0, y0, x1, y1))
+                        
+                        # 3. Adaptive threshold
+                        crop_adapt = cv2.adaptiveThreshold(crop_resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                          cv2.THRESH_BINARY, 11, 2)
+                        candidates.append((crop_adapt, x0, y0, x1, y1))
+                        
+                        # 4. Just the resized grayscale (no threshold)
+                        candidates.append((crop_resized, x0, y0, x1, y1))
+                        
+                        # Limit candidates for speed
+                        if len(candidates) >= 15:
+                            break
+                
+                if len(candidates) >= 15:
+                    break
         except Exception as e:
             continue
         
@@ -228,23 +317,39 @@ def detect_plate_and_ocr(image_path):
     best_conf = 0.0
     best_img = None
 
-    # Try OCR on candidates
+    # Try OCR on candidates - collect all results first
+    all_ocr_results = []
     for crop_img, x0, y0, x1, y1 in candidates:
         try:
             if crop_img is None or getattr(crop_img, "size", 0) == 0:
                 continue
             text, conf = ocr_from_image_variants(crop_img)
-            score = conf * (1.0 + 0.12 * len(text))
-            if score > best_conf:
-                best_conf = score
-                best_text = text
-                best_img = crop_img
-            # Early exit if very confident
-            if best_conf > 0.9:
-                break
-        except Exception:
+            if len(text) >= 5:  # Minimum realistic plate length
+                all_ocr_results.append((text, conf, crop_img))
+        except Exception as e:
             continue
+    
+    # Sort by score: longer results heavily preferred
+    for text, conf, crop_img in all_ocr_results:
+        # Calculate score with strong length preference
+        length_score = 0
+        if len(text) >= 10:
+            length_score = 0.5
+        elif len(text) >= 8:
+            length_score = 0.4
+        elif len(text) >= 6:
+            length_score = 0.3
+        elif len(text) >= 5:
+            length_score = 0.15
+        
+        total_score = conf + length_score
+        
+        if total_score > best_conf:
+            best_conf = total_score
+            best_text = text
+            best_img = crop_img
 
+    # Normalize confidence back to 0-1 range
     if best_conf > 1.0:
         best_conf = min(1.0, best_conf)
 
