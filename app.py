@@ -8,8 +8,6 @@ import numpy as np
 import pytesseract
 import librosa
 import soundfile as sf
-import subprocess
-import shutil
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -380,20 +378,18 @@ def analyze_audio_engine(wav_path):
         print("audio analysis error:", e)
         return {"engine": "unknown", "confidence": 0.0}
 
-def convert_to_wav_with_ffmpeg(input_path, output_wav_path):
+def convert_to_wav_librosa(input_path, output_wav_path):
     """
-    Convert an audio file to WAV using ffmpeg. Returns True on success.
-    Requires ffmpeg in PATH.
+    Convert an audio file to WAV using librosa (no FFmpeg required).
+    Returns True on success.
     """
     try:
-        # ensure ffmpeg exists
-        if not shutil.which("ffmpeg"):
-            raise RuntimeError("ffmpeg not found in PATH")
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", output_wav_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        # librosa can handle various formats with its built-in decoders
+        y, sr = librosa.load(input_path, sr=16000, mono=True)
+        sf.write(output_wav_path, y, sr)
         return True
     except Exception as e:
-        print("ffmpeg convert failed:", e)
+        print("Audio conversion failed:", e)
         return False
 
 @app.route("/", methods=["GET"])
@@ -458,16 +454,16 @@ def analyze():
                     # Already WAV — use directly
                     audio_file_to_use = abs_audio
                 else:
-                    # Try ffmpeg conversion
-                    ok = convert_to_wav_with_ffmpeg(abs_audio, wav_path)
+                    # Convert using librosa (no FFmpeg needed)
+                    ok = convert_to_wav_librosa(abs_audio, wav_path)
                     if ok and os.path.exists(wav_path):
                         audio_file_to_use = wav_path
                     else:
-                        # Try librosa direct load as fallback (may work if audioread/ffmpeg present)
+                        # Direct load as fallback
                         audio_file_to_use = abs_audio
-                # Load and (re)write to ensure consistent format
-                y, sr = librosa.load(audio_file_to_use, sr=None, mono=True)
-                # write to wav_path to ensure waveform file for analysis
+                # Load and normalize to ensure consistent format
+                y, sr = librosa.load(audio_file_to_use, sr=16000, mono=True)
+                # Write to wav_path to ensure waveform file for analysis
                 sf.write(wav_path, y, sr)
                 audio_res = analyze_audio_engine(wav_path)
 
